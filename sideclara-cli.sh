@@ -19,6 +19,7 @@ ENV_FILE="${INSTALL_ROOT}/.env"
 VERSION_FILE="${INSTALL_ROOT}/VERSION"
 LOG_DIR="${INSTALL_ROOT}/logs"
 BACKUP_DIR="${INSTALL_ROOT}/data/backups"
+CACHE_DIR="${SIDECLARA_CACHE_DIR:-${INSTALL_ROOT}/cache/releases}"
 LAST_ERROR_LINK="${LOG_DIR}/ultimo-error.txt"
 
 RED='\033[0;31m'
@@ -244,8 +245,17 @@ write_error_report() {
   ln -sfn "$file" "$LAST_ERROR_LINK"
   echo -e "${RED}Se generó un reporte de error:${NC}"
   echo -e "  ${BOLD}$file${NC}"
-  echo "Puede compartirlo con soporte (opción 8 del menú)."
+  echo "Puede compartirlo con soporte (menú Herramientas → ver error)."
   echo "$file"
+}
+
+require_installed() {
+  if [ ! -f "$COMPOSE_FILE" ] || [ ! -f "$ENV_FILE" ]; then
+    echo -e "${RED}SideClara no parece instalado en ${INSTALL_ROOT}.${NC}"
+    echo "Use Instalación → Instalar / preinstalar primero."
+    return 1
+  fi
+  return 0
 }
 
 port_in_use() {
@@ -373,6 +383,79 @@ download_release_assets() {
   curl -fL --progress-bar -o "${tmpdir}/app.tar.gz" "$img_url"
   curl -fL --progress-bar -o "${tmpdir}/bundle.zip" "$bundle_url"
   echo "$ver" >"${tmpdir}/VERSION"
+}
+
+cache_version() {
+  if [ -f "$CACHE_DIR/VERSION" ]; then
+    tr -d '[:space:]' <"$CACHE_DIR/VERSION"
+  fi
+}
+
+cache_paths_for_version() {
+  local ver="${1#v}"
+  CACHE_APP_TAR="$CACHE_DIR/sideclara-app-${ver}.tar.gz"
+  CACHE_BUNDLE_ZIP="$CACHE_DIR/sideclara-bundle-${ver}.zip"
+}
+
+cache_has_complete() {
+  local ver="${1#v}"
+  cache_paths_for_version "$ver"
+  [ "$(cache_version)" = "$ver" ] && [ -f "$CACHE_APP_TAR" ] && [ -f "$CACHE_BUNDLE_ZIP" ]
+}
+
+save_tmpdir_to_cache() {
+  local tmpdir="$1"
+  local ver
+  ver="$(tr -d '[:space:]' <"${tmpdir}/VERSION")"
+  ver="${ver#v}"
+  mkdir -p "$CACHE_DIR"
+  # Mantener solo la versión actual en caché (ahorra disco)
+  rm -f "$CACHE_DIR"/sideclara-app-*.tar.gz "$CACHE_DIR"/sideclara-bundle-*.zip
+  cp -f "${tmpdir}/app.tar.gz" "$CACHE_DIR/sideclara-app-${ver}.tar.gz"
+  cp -f "${tmpdir}/bundle.zip" "$CACHE_DIR/sideclara-bundle-${ver}.zip"
+  echo "$ver" >"$CACHE_DIR/VERSION"
+  echo "Paquetes guardados en caché: $CACHE_DIR (versión ${ver})"
+}
+
+# Rellena tmpdir con app.tar.gz + bundle.zip + VERSION.
+# Usa caché local si coincide con el tag; si no, descarga y actualiza la caché.
+prepare_release_tmpdir() {
+  local tag="$1"
+  local tmpdir="$2"
+  local ver="${tag#v}"
+
+  if cache_has_complete "$ver"; then
+    echo -e "${GREEN}Usando paquetes en caché (${ver}); no se vuelve a descargar.${NC}"
+    cache_paths_for_version "$ver"
+    cp -f "$CACHE_APP_TAR" "${tmpdir}/app.tar.gz"
+    cp -f "$CACHE_BUNDLE_ZIP" "${tmpdir}/bundle.zip"
+    echo "$ver" >"${tmpdir}/VERSION"
+    return 0
+  fi
+
+  if [ -n "$(cache_version)" ] && [ "$(cache_version)" != "$ver" ]; then
+    echo "Caché local: $(cache_version) — se necesita ${ver}; descargando..."
+  else
+    echo "Caché incompleta o vacía; descargando ${tag}..."
+  fi
+  if ! download_release_assets "$tag" "$tmpdir"; then
+    return 1
+  fi
+  save_tmpdir_to_cache "$tmpdir"
+}
+
+refresh_cli_from_github() {
+  local tmp
+  tmp="$(mktemp)"
+  echo "Actualizando CLI en ${CLI_PATH}..."
+  if curl -fsSL "$RAW_CLI_URL" -o "$tmp"; then
+    install -m 0755 "$tmp" "$CLI_PATH"
+    echo -e "${GREEN}CLI instalado.${NC}"
+  else
+    echo -e "${YELLOW}No se pudo descargar el CLI remoto; se usa el script actual.${NC}"
+    ensure_cli_installed
+  fi
+  rm -f "$tmp"
 }
 
 # Resolve offline assets from a directory or explicit file paths.
@@ -566,7 +649,7 @@ apply_install_from_tmpdir() {
     echo -e "${GREEN}Instalación completada.${NC}"
   else
     echo -e "${YELLOW}Los contenedores arrancaron, pero aún no hay respuesta HTTP.${NC}"
-    echo "Revise la opción 2 (salud) o los logs (opción 8)."
+    echo "Revise el menú Estado (salud) o Herramientas → ver error."
     write_error_report "Sin respuesta HTTP" "Se esperó ~5 minutos en el puerto $http_port"
   fi
 
@@ -596,6 +679,15 @@ do_install_online() {
     fi
   else
     echo "Última release: ${tag}"
+    local cached
+    cached="$(cache_version)"
+    if [ -n "$cached" ]; then
+      if [ "$cached" = "${tag#v}" ] && cache_has_complete "$cached"; then
+        echo -e "Caché local: ${GREEN}${cached} (lista para usar)${NC}"
+      else
+        echo -e "Caché local: ${YELLOW}${cached}${NC}"
+      fi
+    fi
     if [ "${SIDECLARA_NONINTERACTIVE:-0}" != "1" ]; then
       if ! yes_no "¿Instalar la versión ${tag}?"; then
         tag="$(ask "Indique el tag a instalar" "$tag")"
@@ -605,12 +697,54 @@ do_install_online() {
 
   local tmp
   tmp="$(mktemp -d)"
-  if ! download_release_assets "$tag" "$tmp"; then
+  if ! prepare_release_tmpdir "$tag" "$tmp"; then
     write_error_report "Descarga fallida" "tag=$tag"
     rm -rf "$tmp"
     return 1
   fi
   apply_install_from_tmpdir "$tmp"
+}
+
+do_preinstall() {
+  echo -e "${BOLD}=== Preinstalar (CLI + paquetes en caché) ===${NC}"
+  echo "No arranca contenedores. Solo instala el comando sideclara y descarga"
+  echo "los instaladores de la última release para reutilizarlos al instalar."
+  echo
+  check_prereqs || return 1
+  ensure_host_tools || return 1
+  mkdir -p "$INSTALL_ROOT" "$CACHE_DIR" "$LOG_DIR"
+  refresh_cli_from_github
+
+  local tag
+  tag="$(latest_release_tag)"
+  if [ -z "$tag" ]; then
+    echo -e "${RED}No se pudo obtener la última release.${NC}"
+    return 1
+  fi
+  echo "Última release: ${tag}"
+
+  if cache_has_complete "${tag#v}"; then
+    echo -e "${GREEN}Ya tiene los paquetes de ${tag#v} en caché.${NC}"
+    echo "Ubicación: $CACHE_DIR"
+    if [ "${SIDECLARA_NONINTERACTIVE:-0}" != "1" ] && yes_no "¿Volver a descargar de todos modos?"; then
+      rm -f "$CACHE_DIR"/sideclara-app-*.tar.gz "$CACHE_DIR"/sideclara-bundle-*.zip "$CACHE_DIR/VERSION"
+    else
+      echo "Listo. Use Instalación → Instalar para aplicar estos paquetes."
+      return 0
+    fi
+  fi
+
+  local tmp
+  tmp="$(mktemp -d)"
+  if ! prepare_release_tmpdir "$tag" "$tmp"; then
+    write_error_report "Preinstalación: descarga fallida" "tag=$tag"
+    rm -rf "$tmp"
+    return 1
+  fi
+  rm -rf "$tmp"
+  echo -e "${GREEN}Preinstalación completada.${NC}"
+  echo "Caché: $CACHE_DIR"
+  echo "Siguiente paso: menú Instalación → Instalar / reinstalar"
 }
 
 do_install_offline() {
@@ -732,7 +866,7 @@ do_check_updates() {
   if [ "$current" = "$latest_ver" ] || [ "v$current" = "$latest" ]; then
     echo -e "${GREEN}Ya tiene la última versión.${NC}"
   else
-    echo -e "${YELLOW}Hay una versión nueva. Use la opción 4 para actualizar.${NC}"
+    echo -e "${YELLOW}Hay una versión nueva. Use Instalación → Actualizar.${NC}"
   fi
 }
 
@@ -760,7 +894,7 @@ do_update() {
 
   local tmp
   tmp="$(mktemp -d)"
-  if ! download_release_assets "$tag" "$tmp"; then
+  if ! prepare_release_tmpdir "$tag" "$tmp"; then
     write_error_report "Descarga de actualización fallida" "tag=$tag"
     rm -rf "$tmp"
     return 1
@@ -773,7 +907,7 @@ do_update() {
   extract_bundle_to_install_root "${tmp}/bundle.zip"
   mv "$env_bak" "$ENV_FILE"
   local ver
-  ver="$(cat "${tmp}/VERSION")"
+  ver="$(tr -d '[:space:]' <"${tmp}/VERSION")"
   env_set SIDECLARA_VERSION "$ver"
   env_set LOAD_INITIAL_DATA 0
   echo "$ver" >"$VERSION_FILE"
@@ -956,49 +1090,182 @@ do_phpmyadmin() {
   fi
 }
 
-show_menu() {
-  clear 2>/dev/null || true
-  local ver
-  ver="$(cat "$VERSION_FILE" 2>/dev/null || echo "no instalado")"
-  echo -e "${CYAN}${BOLD}"
-  echo "========================================"
-  echo "           SideClara"
-  echo "========================================"
-  echo -e "${NC}"
-  echo "Versión: $ver"
-  echo "Directorio: $INSTALL_ROOT"
-  echo
-  echo "1) Instalar / reinstalar"
-  echo "2) Estado del sistema (salud)"
-  echo "3) Buscar actualizaciones"
-  echo "4) Actualizar a una nueva versión"
-  echo "5) Respaldo de base de datos"
-  echo "6) Restaurar base de datos"
-  echo "7) Cambiar puerto HTTP"
-  echo "8) Ver / compartir último error"
-  echo "9) (Opcional) Activar phpMyAdmin"
-  echo "10) Instalar desde archivos locales (offline)"
-  echo "0) Salir"
-  echo
+do_start() {
+  echo -e "${BOLD}=== Iniciar servicios ===${NC}"
+  require_installed || return 1
+  if ! compose_up; then
+    write_error_report "No se pudieron iniciar los servicios" ""
+    return 1
+  fi
+  echo -e "${GREEN}Servicios iniciados.${NC}"
 }
 
-main_menu() {
+do_restart() {
+  echo -e "${BOLD}=== Reiniciar servicios ===${NC}"
+  require_installed || return 1
+  echo "Esto reinicia los contenedores de SideClara (la BD también se reinicia brevemente)."
+  if [ "${SIDECLARA_NONINTERACTIVE:-0}" != "1" ] && ! yes_no "¿Continuar?"; then
+    echo "Cancelado."
+    return 1
+  fi
+  if compose restart; then
+    echo -e "${GREEN}Servicios reiniciados.${NC}"
+  else
+    echo -e "${YELLOW}compose restart falló; intentando compose up -d...${NC}"
+    if ! compose_up; then
+      write_error_report "Reinicio falló" ""
+      return 1
+    fi
+    echo -e "${GREEN}Servicios levantados de nuevo.${NC}"
+  fi
+}
+
+do_stop() {
+  echo -e "${BOLD}=== Detener servicios ===${NC}"
+  require_installed || return 1
+  echo -e "${YELLOW}Los contenedores se detendrán. Los datos en volúmenes se conservan.${NC}"
+  echo "La web dejará de responder hasta que inicie de nuevo."
+  if [ "${SIDECLARA_NONINTERACTIVE:-0}" != "1" ] && ! yes_no "¿Detener SideClara ahora?"; then
+    echo "Cancelado."
+    return 1
+  fi
+  compose stop || true
+  echo -e "${GREEN}Servicios detenidos.${NC}"
+}
+
+do_uninstall() {
+  echo -e "${BOLD}=== Desinstalar SideClara ===${NC}"
+  echo
+  echo -e "${RED}${BOLD}ADVERTENCIA${NC}"
+  echo "Esta acción puede eliminar contenedores, el directorio de instalación"
+  echo "y, si lo confirma, también la base de datos y archivos subidos."
+  echo "Directorio: $INSTALL_ROOT"
+  echo
+  if ! yes_no "¿Desea continuar con la desinstalación?"; then
+    echo "Cancelado."
+    return 1
+  fi
+
+  local remove_volumes=0
+  if [ -f "$COMPOSE_FILE" ]; then
+    echo
+    echo -e "${YELLOW}¿Eliminar también los VOLÚMENES (BD MySQL, media, static)?${NC}"
+    echo "Si responde sí, se pierde la información de declaraciones. Haga un respaldo antes."
+    if yes_no "¿Borrar volúmenes de datos? (irreversible)"; then
+      if yes_no "Confirme de nuevo: ¿borrar definitivamente la base de datos y archivos?"; then
+        remove_volumes=1
+      fi
+    fi
+    echo "Deteniendo contenedores..."
+    if [ "$remove_volumes" -eq 1 ]; then
+      (cd "$INSTALL_ROOT" && docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down -v) || true
+    else
+      (cd "$INSTALL_ROOT" && docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down) || true
+    fi
+  fi
+
+  for name in "${FIXED_CONTAINER_NAMES[@]}"; do
+    docker rm -f "$name" >/dev/null 2>&1 || true
+  done
+
+  local remove_dir=0
+  if [ -d "$INSTALL_ROOT" ]; then
+    if yes_no "¿Eliminar el directorio ${INSTALL_ROOT} (config, logs, caché, respaldos)?"; then
+      remove_dir=1
+    fi
+  fi
+  if [ "$remove_dir" -eq 1 ]; then
+    rm -rf "$INSTALL_ROOT"
+    echo "Directorio eliminado."
+  fi
+
+  if [ -e "$CLI_PATH" ] && yes_no "¿Eliminar el comando ${CLI_PATH}?"; then
+    rm -f "$CLI_PATH"
+    echo "CLI eliminado."
+  fi
+
+  echo
+  if [ "$remove_volumes" -eq 1 ]; then
+    echo -e "${GREEN}Desinstalación completada (incluidos volúmenes).${NC}"
+  else
+    echo -e "${GREEN}Desinstalación de contenedores completada.${NC}"
+    if [ "$remove_dir" -eq 0 ]; then
+      echo "Los datos/config pueden seguir en $INSTALL_ROOT"
+    fi
+    echo "Volúmenes Docker de SideClara pueden seguir en el sistema si no los borró."
+  fi
+}
+
+do_clean_temp() {
+  echo -e "${BOLD}=== Limpiar archivos temporales ===${NC}"
+  echo "Se pueden borrar:"
+  echo "  • /tmp/sideclara* (descargas temporales)"
+  echo "  • Caché de paquetes: $CACHE_DIR"
+  echo "  • Reportes de error antiguos en $LOG_DIR (opcional)"
+  echo
+  local freed=0
+
+  if yes_no "¿Limpiar /tmp/sideclara* ?"; then
+    rm -rf /tmp/sideclara /tmp/sideclara-* /tmp/sideclara_cli* 2>/dev/null || true
+    echo "Temporales /tmp/sideclara* eliminados (si existían)."
+    freed=1
+  fi
+
+  if [ -d "$CACHE_DIR" ]; then
+    local cver size
+    cver="$(cache_version)"
+    size="$(du -sh "$CACHE_DIR" 2>/dev/null | awk '{print $1}')"
+    echo "Caché actual: versión=${cver:-vacía} tamaño=${size:-?} ($CACHE_DIR)"
+    if yes_no "¿Vaciar la caché de instaladores? (la próxima instalación descargará de nuevo)"; then
+      rm -rf "$CACHE_DIR"
+      mkdir -p "$CACHE_DIR"
+      echo "Caché vaciada."
+      freed=1
+    fi
+  else
+    echo "No hay caché de paquetes."
+  fi
+
+  if [ -d "$LOG_DIR" ] && yes_no "¿Borrar reportes de error antiguos (conservar el último)?"; then
+    local last=""
+    if [ -L "$LAST_ERROR_LINK" ] || [ -f "$LAST_ERROR_LINK" ]; then
+      last="$(readlink -f "$LAST_ERROR_LINK" 2>/dev/null || true)"
+    fi
+    if [ -n "$last" ]; then
+      find "$LOG_DIR" -maxdepth 1 -type f -name 'error-*.txt' ! -samefile "$last" -delete 2>/dev/null || \
+        find "$LOG_DIR" -maxdepth 1 -type f -name 'error-*.txt' ! -path "$last" -delete 2>/dev/null || true
+    else
+      find "$LOG_DIR" -maxdepth 1 -type f -name 'error-*.txt' -delete 2>/dev/null || true
+    fi
+    echo "Reportes antiguos eliminados."
+    freed=1
+  fi
+
+  if [ "$freed" -eq 0 ]; then
+    echo "No se eliminó nada."
+  else
+    echo -e "${GREEN}Limpieza terminada.${NC}"
+  fi
+}
+
+menu_instalacion() {
   while true; do
-    show_menu
+    echo
+    echo -e "${BOLD}--- Instalación ---${NC}"
+    echo "1) Instalar / reinstalar"
+    echo "2) Preinstalar (CLI + descargar paquetes a caché)"
+    echo "3) Buscar actualizaciones"
+    echo "4) Actualizar a una nueva versión"
+    echo "5) Instalar desde archivos locales (offline)"
+    echo "0) Volver"
     local opt
-    # Sin default "0": si read falla, no salir del menú automáticamente
-    opt="$(ask "Elija una opción" "")"
+    opt="$(ask "Elija" "")"
     case "$opt" in
       1) do_install; pause ;;
-      2) do_health; pause ;;
+      2) do_preinstall; pause ;;
       3) do_check_updates; pause ;;
       4) do_update; pause ;;
-      5) do_backup; pause ;;
-      6) do_restore; pause ;;
-      7) do_change_port; pause ;;
-      8) do_show_error; pause ;;
-      9) do_phpmyadmin; pause ;;
-      10)
+      5)
         echo -e "${BOLD}=== Instalación offline ===${NC}"
         check_prereqs || { pause; continue; }
         ensure_host_tools || { pause; continue; }
@@ -1008,6 +1275,110 @@ main_menu() {
         do_install_offline
         pause
         ;;
+      0|"") return 0 ;;
+      *) echo "Opción no válida." ;;
+    esac
+  done
+}
+
+menu_servicios() {
+  while true; do
+    echo
+    echo -e "${BOLD}--- Servicios ---${NC}"
+    echo "1) Iniciar"
+    echo "2) Reiniciar"
+    echo "3) Detener"
+    echo "0) Volver"
+    local opt
+    opt="$(ask "Elija" "")"
+    case "$opt" in
+      1) do_start; pause ;;
+      2) do_restart; pause ;;
+      3) do_stop; pause ;;
+      0|"") return 0 ;;
+      *) echo "Opción no válida." ;;
+    esac
+  done
+}
+
+menu_datos() {
+  while true; do
+    echo
+    echo -e "${BOLD}--- Datos ---${NC}"
+    echo "1) Respaldo de base de datos"
+    echo "2) Restaurar base de datos"
+    echo "0) Volver"
+    local opt
+    opt="$(ask "Elija" "")"
+    case "$opt" in
+      1) do_backup; pause ;;
+      2) do_restore; pause ;;
+      0|"") return 0 ;;
+      *) echo "Opción no válida." ;;
+    esac
+  done
+}
+
+menu_herramientas() {
+  while true; do
+    echo
+    echo -e "${BOLD}--- Herramientas ---${NC}"
+    echo "1) Cambiar puerto HTTP"
+    echo "2) Ver / compartir último error"
+    echo "3) Activar / gestionar phpMyAdmin"
+    echo "4) Limpiar archivos temporales / caché"
+    echo "0) Volver"
+    local opt
+    opt="$(ask "Elija" "")"
+    case "$opt" in
+      1) do_change_port; pause ;;
+      2) do_show_error; pause ;;
+      3) do_phpmyadmin; pause ;;
+      4) do_clean_temp; pause ;;
+      0|"") return 0 ;;
+      *) echo "Opción no válida." ;;
+    esac
+  done
+}
+
+show_menu() {
+  clear 2>/dev/null || true
+  local ver cached
+  ver="$(cat "$VERSION_FILE" 2>/dev/null || echo "no instalado")"
+  cached="$(cache_version)"
+  echo -e "${CYAN}${BOLD}"
+  echo "========================================"
+  echo "           SideClara"
+  echo "========================================"
+  echo -e "${NC}"
+  echo "Versión instalada: $ver"
+  echo "Directorio: $INSTALL_ROOT"
+  if [ -n "$cached" ]; then
+    echo "Caché de paquetes: $cached ($CACHE_DIR)"
+  fi
+  echo
+  echo "1) Instalación (instalar, preinstalar, actualizar…)"
+  echo "2) Servicios (iniciar, reiniciar, detener)"
+  echo "3) Estado del sistema (salud)"
+  echo "4) Datos (respaldo / restaurar)"
+  echo "5) Herramientas (puerto, errores, phpMyAdmin, limpiar)"
+  echo "6) Desinstalar"
+  echo "0) Salir"
+  echo
+}
+
+main_menu() {
+  while true; do
+    show_menu
+    local opt
+    opt="$(ask "Elija una opción" "")"
+    case "$opt" in
+      1) menu_instalacion ;;
+      2) menu_servicios ;;
+      3) do_health; pause ;;
+      4) menu_datos ;;
+      5) menu_herramientas ;;
+      6) do_uninstall; pause ;;
       0) echo "Hasta luego."; exit 0 ;;
       "")
         echo -e "${YELLOW}No se recibió opción. Si usó curl|bash, pruebe:${NC}"
@@ -1025,9 +1396,9 @@ main() {
   ensure_cli_installed
   mkdir -p "$INSTALL_ROOT" "$LOG_DIR"
 
-  # Subcomandos no interactivos opcionales
   case "${1:-}" in
     install) shift; do_install "$@"; exit $? ;;
+    preinstall) do_preinstall; exit $? ;;
     install-offline|offline)
       shift
       check_prereqs || exit 1
@@ -1038,8 +1409,13 @@ main() {
       exit $?
       ;;
     health|status) do_health; exit $? ;;
+    start) do_start; exit $? ;;
+    restart) do_restart; exit $? ;;
+    stop) do_stop; exit $? ;;
     update) shift; do_update "$@"; exit $? ;;
     backup) do_backup; exit $? ;;
+    uninstall) do_uninstall; exit $? ;;
+    clean|clean-temp) do_clean_temp; exit $? ;;
     *) main_menu ;;
   esac
 }
