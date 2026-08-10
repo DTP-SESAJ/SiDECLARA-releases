@@ -269,20 +269,60 @@ port_in_use() {
   return 1
 }
 
+# True if the host port is published by our nginx container (safe to reuse on reinstall).
+port_held_by_sideclara() {
+  local port="$1"
+  docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null \
+    | grep -E '^declaraciones_nginx[[:space:]]' \
+    | grep -qE "[:.]${port}->"
+}
+
+# Busy only if something other than SideClara holds the port.
+port_busy_by_others() {
+  local port="$1"
+  if ! port_in_use "$port"; then
+    return 1
+  fi
+  if port_held_by_sideclara "$port"; then
+    return 1
+  fi
+  return 0
+}
+
+# Stop current stack so reinstall can keep the same HTTP_PORT.
+stop_stack_to_free_ports() {
+  if [ ! -f "$COMPOSE_FILE" ]; then
+    return 0
+  fi
+  echo "Deteniendo servicios actuales para liberar / reutilizar puertos..."
+  compose stop >/dev/null 2>&1 || true
+  # Contenedores huérfanos con los mismos nombres también pueden ocupar el puerto
+  docker stop declaraciones_nginx 2>/dev/null || true
+}
+
 choose_http_port() {
-  local port
+  local port reuse_msg=""
   port="$(env_get HTTP_PORT 80)"
-  if port_in_use "$port"; then
-    echo -e "${YELLOW}El puerto ${port} ya está en uso en este equipo.${NC}"
+  if port_held_by_sideclara "$port"; then
+    echo -e "${GREEN}El puerto ${port} ya lo usa SideClara; se reutilizará.${NC}"
+    env_set HTTP_PORT "$port"
+    echo "$port"
+    return 0
+  fi
+  if port_busy_by_others "$port"; then
+    echo -e "${YELLOW}El puerto ${port} ya está en uso por otro proceso.${NC}"
     while true; do
       port="$(ask "Ingrese otro puerto HTTP" "8080")"
       if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
         echo "Puerto inválido."
         continue
       fi
-      if port_in_use "$port"; then
+      if port_busy_by_others "$port"; then
         echo "El puerto $port también está ocupado. Pruebe otro."
         continue
+      fi
+      if port_held_by_sideclara "$port"; then
+        echo "Ese puerto es de SideClara; se reutilizará."
       fi
       break
     done
@@ -551,6 +591,9 @@ apply_install_from_tmpdir() {
   local tmp="$1"
   local skip_cleanup="${2:-0}"
 
+  # Liberar puertos de una instalación previa (evita pedir otro HTTP_PORT al reinstalar)
+  stop_stack_to_free_ports
+
   # Preservar .env existente al reinstalar
   local env_bak=""
   if [ -f "$ENV_FILE" ]; then
@@ -576,20 +619,32 @@ apply_install_from_tmpdir() {
   if [ -n "${SIDECLARA_HTTP_PORT:-}" ]; then
     env_set HTTP_PORT "$SIDECLARA_HTTP_PORT"
     http_port="$SIDECLARA_HTTP_PORT"
-    if port_in_use "$http_port"; then
-      echo -e "${YELLOW}Advertencia: el puerto ${http_port} parece ocupado.${NC}"
+    if port_busy_by_others "$http_port"; then
+      echo -e "${YELLOW}Advertencia: el puerto ${http_port} parece ocupado por otro proceso.${NC}"
     fi
   elif [ "${SIDECLARA_NONINTERACTIVE:-0}" = "1" ]; then
     http_port="$(env_get HTTP_PORT 8080)"
-    if port_in_use 80 && [ "$http_port" = "80" ]; then
+    if port_busy_by_others 80 && [ "$http_port" = "80" ]; then
       http_port=8080
     fi
-    while port_in_use "$http_port"; do
+    while port_busy_by_others "$http_port"; do
       http_port=$((http_port + 1))
     done
     env_set HTTP_PORT "$http_port"
   else
-    http_port="$(choose_http_port)"
+    # Si ya había HTTP_PORT en .env (reinstalación), preferirlo sin preguntar
+    if [ -n "$env_bak" ] && [ -n "$(env_get HTTP_PORT "")" ]; then
+      http_port="$(env_get HTTP_PORT 80)"
+      if port_busy_by_others "$http_port"; then
+        echo -e "${YELLOW}El puerto configurado ${http_port} está ocupado por otro proceso.${NC}"
+        http_port="$(choose_http_port)"
+      else
+        echo -e "${GREEN}Reutilizando puerto HTTP ${http_port} de la instalación anterior.${NC}"
+        env_set HTTP_PORT "$http_port"
+      fi
+    else
+      http_port="$(choose_http_port)"
+    fi
   fi
 
   local ver
@@ -1027,7 +1082,7 @@ do_change_port() {
     echo "Puerto inválido."
     return 1
   fi
-  if [ "$new" != "$current" ] && port_in_use "$new"; then
+  if [ "$new" != "$current" ] && port_busy_by_others "$new"; then
     echo "El puerto $new está ocupado."
     return 1
   fi
@@ -1248,6 +1303,39 @@ do_clean_temp() {
   fi
 }
 
+do_load_catalogs() {
+  echo -e "${BOLD}=== Cargar catálogos iniciales ===${NC}"
+  require_installed || return 1
+  if ! docker ps --format '{{.Names}}' | grep -qx declaraciones_django; then
+    echo -e "${RED}El contenedor de la aplicación no está en ejecución.${NC}"
+    echo "Use Servicios → Iniciar y vuelva a intentar."
+    return 1
+  fi
+
+  echo "Esto ejecuta loaddata de catálogos (estados, municipios, tipos, FAQ, etc.)."
+  echo -e "${YELLOW}Si ya hay datos, pueden aparecer errores de clave duplicada en algunos fixtures.${NC}"
+  echo "También carga dumpAuthUser (usuarios de ejemplo del fixture)."
+  echo
+  if [ "${SIDECLARA_NONINTERACTIVE:-0}" != "1" ] && ! yes_no "¿Cargar catálogos ahora?"; then
+    echo "Cancelado."
+    return 1
+  fi
+
+  echo "Cargando catálogos (puede tardar varios minutos)..."
+  if docker exec -e LOAD_INITIAL_DATA=1 declaraciones_django sh /code/scripts/loaddata-catalog.sh; then
+    docker exec declaraciones_django touch /var/lib/sideclara/.initialized 2>/dev/null || true
+    env_set LOAD_INITIAL_DATA 0
+    echo -e "${GREEN}Carga de catálogos finalizada.${NC}"
+    echo "Marcador de inicialización actualizado; no se volverán a cargar solos al reiniciar."
+    return 0
+  fi
+
+  write_error_report "Carga de catálogos falló" "loaddata-catalog.sh"
+  echo -e "${YELLOW}La carga terminó con errores. Revise el reporte o los logs del contenedor.${NC}"
+  echo "Si solo fallaron fixtures ya existentes, parte de los catálogos puede estar bien."
+  return 1
+}
+
 menu_instalacion() {
   while true; do
     echo
@@ -1257,6 +1345,7 @@ menu_instalacion() {
     echo "3) Buscar actualizaciones"
     echo "4) Actualizar a una nueva versión"
     echo "5) Instalar desde archivos locales (offline)"
+    echo "6) Cargar catálogos iniciales"
     echo "0) Volver"
     local opt
     opt="$(ask "Elija" "")"
@@ -1275,6 +1364,7 @@ menu_instalacion() {
         do_install_offline
         pause
         ;;
+      6) do_load_catalogs; pause ;;
       0|"") return 0 ;;
       *) echo "Opción no válida." ;;
     esac
@@ -1307,12 +1397,14 @@ menu_datos() {
     echo -e "${BOLD}--- Datos ---${NC}"
     echo "1) Respaldo de base de datos"
     echo "2) Restaurar base de datos"
+    echo "3) Cargar catálogos iniciales"
     echo "0) Volver"
     local opt
     opt="$(ask "Elija" "")"
     case "$opt" in
       1) do_backup; pause ;;
       2) do_restore; pause ;;
+      3) do_load_catalogs; pause ;;
       0|"") return 0 ;;
       *) echo "Opción no válida." ;;
     esac
@@ -1414,6 +1506,7 @@ main() {
     stop) do_stop; exit $? ;;
     update) shift; do_update "$@"; exit $? ;;
     backup) do_backup; exit $? ;;
+    load-catalogs|catalogs) do_load_catalogs; exit $? ;;
     uninstall) do_uninstall; exit $? ;;
     clean|clean-temp) do_clean_temp; exit $? ;;
     *) main_menu ;;
