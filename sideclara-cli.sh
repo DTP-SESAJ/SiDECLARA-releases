@@ -129,6 +129,45 @@ compose() {
   (cd "$INSTALL_ROOT" && docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@")
 }
 
+# Nombres fijos en deploy/docker-compose.yml. Una instalación anterior en otra
+# carpeta deja contenedores con el mismo nombre y `compose up` falla con
+# "already in use", aunque a veces no aparezcan en `docker ps` (solo en -a).
+FIXED_CONTAINER_NAMES=(
+  declaraciones_db
+  declaraciones_cache
+  declaraciones_django
+  declaraciones_nginx
+  declaraciones_phpmyadmin
+)
+
+reclaim_fixed_container_names() {
+  local name id workdir ours
+  ours="$(cd "$INSTALL_ROOT" 2>/dev/null && pwd -P || echo "$INSTALL_ROOT")"
+  for name in "${FIXED_CONTAINER_NAMES[@]}"; do
+    id="$(docker inspect -f '{{.Id}}' "$name" 2>/dev/null || true)"
+    if [ -z "$id" ]; then
+      continue
+    fi
+    workdir="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$name" 2>/dev/null || true)"
+    if [ -n "$workdir" ]; then
+      workdir="$(cd "$workdir" 2>/dev/null && pwd -P || echo "$workdir")"
+    fi
+    if [ -n "$workdir" ] && [ "$workdir" = "$ours" ]; then
+      continue
+    fi
+    echo -e "${YELLOW}Eliminando contenedor conflictivo de otra instalación: ${name}${NC}"
+    if [ -n "$workdir" ]; then
+      echo "  (pertenecía a: $workdir)"
+    fi
+    docker rm -f "$name" >/dev/null || true
+  done
+}
+
+compose_up() {
+  reclaim_fixed_container_names
+  compose up -d "$@"
+}
+
 env_get() {
   local key="$1"
   local default="${2:-}"
@@ -495,7 +534,7 @@ apply_install_from_tmpdir() {
   fi
 
   echo "Iniciando servicios..."
-  if ! compose up -d; then
+  if ! compose_up; then
     write_error_report "compose up falló" "HTTP_PORT=$http_port"
     return 1
   fi
@@ -748,7 +787,7 @@ do_update() {
     docker tag sideclara-app:latest "sideclara-app:${ver}" 2>/dev/null || true
   rm -rf "$tmp"
 
-  if ! compose up -d; then
+  if ! compose_up; then
     write_error_report "compose up tras actualizar falló" "tag=$tag"
     return 1
   fi
