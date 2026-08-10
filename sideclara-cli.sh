@@ -36,71 +36,89 @@ require_root() {
 }
 
 # Si llega por pipe (curl | bash), guardar e invocar con TTY interactivo.
-# No activar solo porque stdin no es TTY (p. ej. sudo / CI): eso rompe pruebas locales.
 bootstrap_if_piped() {
   if [ -n "${SIDECLARA_CLI_BOOTSTRAPPED:-}" ]; then
     return 0
   fi
   local src="${BASH_SOURCE[0]:-}"
-  # Ejecución normal desde un archivo en disco
-  if [ -n "$src" ] && [ -f "$src" ]; then
-    return 0
-  fi
+  local from_pipe=0
+
   case "$src" in
-    /dev/fd/*|/proc/self/fd/*|"")
-      ;;
-    *)
-      return 0
+    /dev/fd/*|/proc/self/fd/*|/dev/stdin|"")
+      from_pipe=1
       ;;
   esac
+  # Algunos sistemas reportan /dev/fd/N como "-f" aunque sea un pipe
+  if [ "$from_pipe" -eq 0 ] && [ -n "$src" ] && [ -f "$src" ] && [ -t 0 ]; then
+    return 0
+  fi
+  if [ "$from_pipe" -eq 0 ] && [ -t 0 ]; then
+    return 0
+  fi
 
-  echo "Descargando SideClara CLI..."
+  echo "Preparando CLI interactivo..."
   tmp="$(mktemp)"
-  if ! curl -fsSL "$RAW_CLI_URL" -o "$tmp"; then
+  # Preferir el propio script si ya está en disco; si no, descargar
+  if [ -n "$src" ] && [ -f "$src" ] && [[ "$src" != /dev/fd/* && "$src" != /proc/self/fd/* ]]; then
+    cp "$src" "$tmp"
+  elif ! curl -fsSL "$RAW_CLI_URL" -o "$tmp"; then
     echo -e "${RED}No se pudo descargar el CLI desde GitHub.${NC}"
     echo "Descargue manualmente: $RAW_CLI_URL"
-    echo "O ejecute el script local: sudo bash sideclara-cli.sh"
+    echo "O ejecute: curl -fsSL \"$RAW_CLI_URL\" -o /tmp/sideclara-cli.sh && sudo bash /tmp/sideclara-cli.sh"
     exit 1
   fi
   install -m 0755 "$tmp" "$CLI_PATH"
   rm -f "$tmp"
   export SIDECLARA_CLI_BOOTSTRAPPED=1
   if [ -r /dev/tty ]; then
-    exec "$CLI_PATH" "$@" </dev/tty
+    exec "$CLI_PATH" "$@" </dev/tty >/dev/tty 2>&1
   else
-    exec "$CLI_PATH" "$@"
+    echo -e "${RED}No hay terminal interactiva (/dev/tty).${NC}"
+    echo "Ejecute: curl -fsSL \"$RAW_CLI_URL\" -o /tmp/sideclara-cli.sh && sudo bash /tmp/sideclara-cli.sh"
+    exit 1
+  fi
+}
+
+# Leer siempre desde la terminal real (evita que curl|bash cierre el menú al instante)
+read_tty() {
+  # usage: read_tty [-p prompt] var
+  if [ -r /dev/tty ]; then
+    read "$@" </dev/tty
+  else
+    read "$@"
   fi
 }
 
 ensure_cli_installed() {
   mkdir -p "$(dirname "$CLI_PATH")"
-  if [ -f "${BASH_SOURCE[0]}" ] && [ "${BASH_SOURCE[0]}" != "$CLI_PATH" ]; then
+  if [ -f "${BASH_SOURCE[0]}" ] && [ "${BASH_SOURCE[0]}" != "$CLI_PATH" ] \
+    && [[ "${BASH_SOURCE[0]}" != /dev/fd/* && "${BASH_SOURCE[0]}" != /proc/self/fd/* ]]; then
     install -m 0755 "${BASH_SOURCE[0]}" "$CLI_PATH" 2>/dev/null || true
   fi
 }
 
 pause() {
   echo
-  read -r -p "Presione ENTER para continuar..." _
+  read_tty -r -p "Presione ENTER para continuar..." _
 }
 
 ask() {
   local prompt="$1"
   local default="${2:-}"
-  local reply
+  local reply=""
   if [ -n "$default" ]; then
-    read -r -p "$prompt [$default]: " reply || true
+    read_tty -r -p "$prompt [$default]: " reply || true
     echo "${reply:-$default}"
   else
-    read -r -p "$prompt: " reply || true
+    read_tty -r -p "$prompt: " reply || true
     echo "$reply"
   fi
 }
 
 yes_no() {
   local prompt="$1"
-  local reply
-  read -r -p "$prompt [s/N]: " reply || true
+  local reply=""
+  read_tty -r -p "$prompt [s/N]: " reply || true
   case "${reply:-}" in
     s|S|si|Si|SI|y|Y|yes|YES) return 0 ;;
     *) return 1 ;;
@@ -929,7 +947,8 @@ main_menu() {
   while true; do
     show_menu
     local opt
-    opt="$(ask "Elija una opción" "0")"
+    # Sin default "0": si read falla, no salir del menú automáticamente
+    opt="$(ask "Elija una opción" "")"
     case "$opt" in
       1) do_install; pause ;;
       2) do_health; pause ;;
@@ -951,6 +970,11 @@ main_menu() {
         pause
         ;;
       0) echo "Hasta luego."; exit 0 ;;
+      "")
+        echo -e "${YELLOW}No se recibió opción. Si usó curl|bash, pruebe:${NC}"
+        echo "  curl -fsSL \"$RAW_CLI_URL\" -o /tmp/sideclara-cli.sh && sudo bash /tmp/sideclara-cli.sh"
+        pause
+        ;;
       *) echo "Opción no válida."; pause ;;
     esac
   done
