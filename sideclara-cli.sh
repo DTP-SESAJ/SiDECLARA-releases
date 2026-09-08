@@ -169,6 +169,23 @@ compose_up() {
   compose up -d "$@"
 }
 
+# Refleja en la UI (updater) la versión instalada/actualizada por CLI.
+sync_updater_ui() {
+  local ver="${1:-}"
+  ver="${ver#v}"
+  if ! docker ps --format '{{.Names}}' | grep -qx declaraciones_django; then
+    return 0
+  fi
+  local args=(python manage.py sync_updater_config --record --source cli)
+  if [ -n "$ver" ]; then
+    args+=(--version "$ver")
+  fi
+  echo "Actualizando panel de actualizaciones del sistema..."
+  docker exec declaraciones_django "${args[@]}" 2>/dev/null || \
+    echo -e "${YELLOW}No se pudo sincronizar el panel de actualizaciones (se intentará al reiniciar la app).${NC}"
+}
+
+
 env_get() {
   local key="$1"
   local default="${2:-}"
@@ -702,6 +719,7 @@ apply_install_from_tmpdir() {
 
   if [ "$ok" -eq 1 ]; then
     echo -e "${GREEN}Instalación completada.${NC}"
+    sync_updater_ui "$ver"
   else
     echo -e "${YELLOW}Los contenedores arrancaron, pero aún no hay respuesta HTTP.${NC}"
     echo "Revise el menú Estado (salud) o Herramientas → ver error."
@@ -982,6 +1000,14 @@ do_update() {
   fi
   echo -e "${GREEN}Actualización a ${ver} completada.${NC}"
   echo "Las migraciones se aplican al arrancar el contenedor de la aplicación."
+  # Esperar un momento a que el entrypoint termine migrate + sync
+  local i
+  for i in $(seq 1 30); do
+    if docker exec declaraciones_django python manage.py sync_updater_config --record --source cli --version "$ver" 2>/dev/null; then
+      break
+    fi
+    sleep 2
+  done
 }
 
 do_backup() {
