@@ -21,6 +21,10 @@ LOG_DIR="${INSTALL_ROOT}/logs"
 BACKUP_DIR="${INSTALL_ROOT}/data/backups"
 CACHE_DIR="${SIDECLARA_CACHE_DIR:-${INSTALL_ROOT}/cache/releases}"
 LAST_ERROR_LINK="${LOG_DIR}/ultimo-error.txt"
+UPDATE_CHECK_SERVICE="/etc/systemd/system/sideclara-update-check.service"
+UPDATE_CHECK_TIMER="/etc/systemd/system/sideclara-update-check.timer"
+BACKUP_SERVICE="/etc/systemd/system/sideclara-backup.service"
+BACKUP_TIMER="/etc/systemd/system/sideclara-backup.timer"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -50,7 +54,8 @@ bootstrap_if_piped() {
       ;;
   esac
   # Algunos sistemas reportan /dev/fd/N como "-f" aunque sea un pipe
-  if [ "$from_pipe" -eq 0 ] && [ -n "$src" ] && [ -f "$src" ] && [ -t 0 ]; then
+  # Un archivo real puede ejecutarse sin TTY (systemd/cron/subcomandos).
+  if [ "$from_pipe" -eq 0 ] && [ -n "$src" ] && [ -f "$src" ]; then
     return 0
   fi
   if [ "$from_pipe" -eq 0 ] && [ -t 0 ]; then
@@ -214,6 +219,107 @@ env_set() {
   else
     echo "${key}=${value}" >>"$ENV_FILE"
   fi
+}
+
+timer_calendar() {
+  case "$1" in
+    daily-08) echo "*-*-* 08:00:00" ;;
+    daily-18) echo "*-*-* 18:00:00" ;;
+    every-6h) echo "*-*-* 00/6:00:00" ;;
+    weekly) echo "Sun *-*-* 03:00:00" ;;
+    monthly) echo "*-*-01 03:00:00" ;;
+    *) echo "*-*-* 03:00:00" ;;
+  esac
+}
+
+remove_sideclara_timers() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  [ -d /run/systemd/system ] || return 0
+  systemctl disable --now sideclara-update-check.timer sideclara-backup.timer >/dev/null 2>&1 || true
+  rm -f "$UPDATE_CHECK_SERVICE" "$UPDATE_CHECK_TIMER" "$BACKUP_SERVICE" "$BACKUP_TIMER"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+install_sideclara_timers() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  [ -d /run/systemd/system ] || return 0
+  local check_preset backup_preset
+  check_preset="$(env_get SIDECLARA_UPDATE_CHECK_SCHEDULE daily-03)"
+  backup_preset="$(env_get SIDECLARA_BACKUP_SCHEDULE weekly)"
+  env_set SIDECLARA_UPDATE_CHECK_SCHEDULE "$check_preset"
+  env_set SIDECLARA_BACKUP_SCHEDULE "$backup_preset"
+  env_set SIDECLARA_BACKUP_KEEP "$(env_get SIDECLARA_BACKUP_KEEP 3)"
+
+  systemctl disable --now sideclara-update-check.timer sideclara-backup.timer >/dev/null 2>&1 || true
+  rm -f "$UPDATE_CHECK_SERVICE" "$UPDATE_CHECK_TIMER" "$BACKUP_SERVICE" "$BACKUP_TIMER"
+
+  if [ "$check_preset" != "disabled" ]; then
+    cat >"$UPDATE_CHECK_SERVICE" <<EOF
+[Unit]
+Description=SideClara release check
+After=docker.service
+[Service]
+Type=oneshot
+ExecStart=$CLI_PATH check-updates-record
+EOF
+    cat >"$UPDATE_CHECK_TIMER" <<EOF
+[Unit]
+Description=SideClara scheduled release check
+[Timer]
+OnCalendar=$(timer_calendar "$check_preset")
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+  fi
+
+  if [ "$backup_preset" != "disabled" ]; then
+    cat >"$BACKUP_SERVICE" <<EOF
+[Unit]
+Description=SideClara database backup
+After=docker.service
+[Service]
+Type=oneshot
+ExecStart=$CLI_PATH backup
+EOF
+    cat >"$BACKUP_TIMER" <<EOF
+[Unit]
+Description=SideClara scheduled database backup
+[Timer]
+OnCalendar=$(timer_calendar "$backup_preset")
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+  fi
+
+  systemctl daemon-reload || return 1
+  [ ! -f "$UPDATE_CHECK_TIMER" ] || systemctl enable --now sideclara-update-check.timer
+  [ ! -f "$BACKUP_TIMER" ] || systemctl enable --now sideclara-backup.timer
+}
+
+do_configure_schedules() {
+  echo -e "${BOLD}=== Tareas automáticas ===${NC}"
+  echo "Verificación de releases: 1) desactivada  2) diaria 03:00  3) diaria 08:00  4) diaria 18:00  5) cada 6 horas"
+  case "$(ask "Elija" "2")" in
+    1) env_set SIDECLARA_UPDATE_CHECK_SCHEDULE disabled ;;
+    3) env_set SIDECLARA_UPDATE_CHECK_SCHEDULE daily-08 ;;
+    4) env_set SIDECLARA_UPDATE_CHECK_SCHEDULE daily-18 ;;
+    5) env_set SIDECLARA_UPDATE_CHECK_SCHEDULE every-6h ;;
+    *) env_set SIDECLARA_UPDATE_CHECK_SCHEDULE daily-03 ;;
+  esac
+  echo "Backups: 1) desactivados  2) semanales domingo 03:00  3) mensuales día 1, 03:00"
+  case "$(ask "Elija" "2")" in
+    1) env_set SIDECLARA_BACKUP_SCHEDULE disabled ;;
+    3) env_set SIDECLARA_BACKUP_SCHEDULE monthly ;;
+    *) env_set SIDECLARA_BACKUP_SCHEDULE weekly ;;
+  esac
+  local keep
+  keep="$(ask "Cantidad de backups automáticos a conservar" "$(env_get SIDECLARA_BACKUP_KEEP 3)")"
+  [[ "$keep" =~ ^[1-9][0-9]*$ ]] || keep=3
+  env_set SIDECLARA_BACKUP_KEEP "$keep"
+  install_sideclara_timers || echo -e "${YELLOW}No se pudieron configurar los timers de systemd.${NC}"
+  echo -e "${GREEN}Tareas automáticas actualizadas.${NC}"
 }
 
 redact_env_for_log() {
@@ -720,6 +826,7 @@ apply_install_from_tmpdir() {
   if [ "$ok" -eq 1 ]; then
     echo -e "${GREEN}Instalación completada.${NC}"
     sync_updater_ui "$ver"
+    install_sideclara_timers || echo -e "${YELLOW}No se pudieron configurar los timers de systemd.${NC}"
   else
     echo -e "${YELLOW}Los contenedores arrancaron, pero aún no hay respuesta HTTP.${NC}"
     echo "Revise el menú Estado (salud) o Herramientas → ver error."
@@ -943,6 +1050,14 @@ do_check_updates() {
   fi
 }
 
+do_recorded_update_check() {
+  if ! docker ps --format '{{.Names}}' | grep -qx declaraciones_django; then
+    echo "SideClara no está en ejecución; se omite la verificación."
+    return 0
+  fi
+  docker exec declaraciones_django python manage.py check_for_updates
+}
+
 do_update() {
   echo -e "${BOLD}=== Actualizar SideClara ===${NC}"
   if [ ! -f "$COMPOSE_FILE" ]; then
@@ -1008,6 +1123,23 @@ do_update() {
     fi
     sleep 2
   done
+  install_sideclara_timers || echo -e "${YELLOW}No se pudieron configurar los timers de systemd.${NC}"
+}
+
+prune_old_backups() {
+  local keep
+  keep="$(env_get SIDECLARA_BACKUP_KEEP 3)"
+  [[ "$keep" =~ ^[1-9][0-9]*$ ]] || keep=3
+  local files=()
+  shopt -s nullglob
+  files=("$BACKUP_DIR"/sideclara-*.sql.gz)
+  shopt -u nullglob
+  [ "${#files[@]}" -le "$keep" ] && return 0
+  mapfile -t files < <(ls -1t "${files[@]}")
+  local i
+  for ((i=keep; i<${#files[@]}; i++)); do
+    rm -f "${files[$i]}"
+  done
 }
 
 do_backup() {
@@ -1026,8 +1158,15 @@ do_backup() {
   dbname="$(env_get MYSQL_DATABASE declaracionesdb)"
 
   if docker exec declaraciones_db \
-      mysqldump -u"$user" -p"$pass" --single-transaction --routines --triggers "$dbname" \
+      mysqldump -u"$user" -p"$pass" --single-transaction --skip-routines --triggers \
+        --default-character-set=utf8 --hex-blob "$dbname" \
       | gzip -c >"$out"; then
+    if ! gzip -t "$out" || ! gzip -cd "$out" | tail -n 20 | grep -q "Dump completed"; then
+      rm -f "$out"
+      write_error_report "Backup incompleto" "No pasó verificación gzip/footer"
+      return 1
+    fi
+    prune_old_backups
     echo -e "${GREEN}Respaldo guardado en:${NC} $out"
     ls -lh "$out"
   else
@@ -1077,20 +1216,22 @@ do_restore() {
   pass="$(env_get MYSQL_PASSWORD)"
   dbname="$(env_get MYSQL_DATABASE declaracionesdb)"
 
-  if [[ "$src" == *.gz ]]; then
-    if gunzip -c "$src" | docker exec -i declaraciones_db mysql -u"$user" -p"$pass" "$dbname"; then
-      echo -e "${GREEN}Restauración completada.${NC}"
-    else
-      write_error_report "Restauración falló" "archivo=$src"
-      return 1
-    fi
+  local err
+  err="$(mktemp)"
+  if {
+    printf 'SET NAMES utf8; SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0;\n'
+    if [[ "$src" == *.gz ]]; then gunzip -c "$src"; else cat "$src"; fi
+    printf '\nSET UNIQUE_CHECKS=1; SET FOREIGN_KEY_CHECKS=1;\n'
+  } | docker exec -i declaraciones_db mysql \
+        --default-character-set=utf8 -u"$user" -p"$pass" "$dbname" 2>"$err"; then
+    rm -f "$err"
+    echo -e "${GREEN}Restauración completada.${NC}"
   else
-    if docker exec -i declaraciones_db mysql -u"$user" -p"$pass" "$dbname" <"$src"; then
-      echo -e "${GREEN}Restauración completada.${NC}"
-    else
-      write_error_report "Restauración falló" "archivo=$src"
-      return 1
-    fi
+    local detail
+    detail="$(cat "$err")"
+    rm -f "$err"
+    write_error_report "Restauración falló" "archivo=$src\n$detail"
+    return 1
   fi
 }
 
@@ -1226,6 +1367,7 @@ do_uninstall() {
     echo "Cancelado."
     return 1
   fi
+  remove_sideclara_timers
 
   local remove_volumes=0
   if [ -f "$COMPOSE_FILE" ]; then
@@ -1445,6 +1587,7 @@ menu_herramientas() {
     echo "2) Ver / compartir último error"
     echo "3) Activar / gestionar phpMyAdmin"
     echo "4) Limpiar archivos temporales / caché"
+    echo "5) Configurar verificaciones y backups automáticos"
     echo "0) Volver"
     local opt
     opt="$(ask "Elija" "")"
@@ -1453,6 +1596,7 @@ menu_herramientas() {
       2) do_show_error; pause ;;
       3) do_phpmyadmin; pause ;;
       4) do_clean_temp; pause ;;
+      5) do_configure_schedules; pause ;;
       0|"") return 0 ;;
       *) echo "Opción no válida." ;;
     esac
@@ -1531,7 +1675,10 @@ main() {
     restart) do_restart; exit $? ;;
     stop) do_stop; exit $? ;;
     update) shift; do_update "$@"; exit $? ;;
+    check-updates) do_check_updates; exit $? ;;
+    check-updates-record) do_recorded_update_check; exit $? ;;
     backup) do_backup; exit $? ;;
+    configure-schedules) do_configure_schedules; exit $? ;;
     load-catalogs|catalogs) do_load_catalogs; exit $? ;;
     uninstall) do_uninstall; exit $? ;;
     clean|clean-temp) do_clean_temp; exit $? ;;
